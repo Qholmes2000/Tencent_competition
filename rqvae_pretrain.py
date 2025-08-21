@@ -2,98 +2,119 @@ import argparse
 import os
 import pickle
 import time
+import json  # 参考main.py使用json格式记录日志
 from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from tqdm import tqdm
 
 from model import MmEmbDataset, RQVAE
 
 
 def get_args():
     parser = argparse.ArgumentParser()
-    # 数据参数
-    parser.add_argument('--data_dir', required=True, type=str, help='数据根目录（包含creative_emb）')
-    parser.add_argument('--feature_id', default='81', type=str, help='多模态特征ID（81-86）')
-    parser.add_argument('--batch_size', default=256, type=int)
-    parser.add_argument('--num_workers', default=8, type=int)
-    
-    # RQVAE参数
-    parser.add_argument('--input_dim', default=1024, type=int, help='多模态emb维度（81为32，82为1024等）')
-    parser.add_argument('--hidden_channels', nargs='+', default=[512, 256], type=int, help='编码器/解码器隐藏层')
-    parser.add_argument('--latent_dim', default=128, type=int, help='潜在空间维度')
-    parser.add_argument('--num_codebooks', default=4, type=int, help='码本数量')
-    parser.add_argument('--codebook_size', nargs='+', default=[128, 128, 128, 128], type=int, help='每个码本大小')
-    parser.add_argument('--shared_codebook', action='store_true', help='是否共享码本')
-    parser.add_argument('--kmeans_method', default='kmeans', choices=['kmeans', 'bkmeans'], help='聚类方法')
-    parser.add_argument('--kmeans_iters', default=100, type=int, help='kmeans迭代次数')
-    parser.add_argument('--distances_method', default='l2', choices=['l2', 'cosine'], help='距离计算方式')
-    parser.add_argument('--loss_beta', default=0.25, type=float, help='RQ损失权重')
-    
-    # 训练参数
-    parser.add_argument('--lr', default=0.0005, type=float)
-    parser.add_argument('--num_epochs', default=10, type=int)
-    parser.add_argument('--device', default='cuda', type=str)
-    parser.add_argument('--save_dir', default='./rqvae_pretrain', type=str, help='模型和语义ID保存目录')
-    
+    # 保持原有参数...
+    parser.add_argument('--log_dir', default=os.environ.get('TRAIN_LOG_PATH', './logs'), type=str)
+    parser.add_argument('--save_dir', default=os.environ.get('TRAIN_CKPT_PATH', './rqvae_pretrain'), type=str)
+    parser.add_argument('--log_interval', default=100, type=int, help='每N步打印一次日志')  # 新增：日志间隔
     return parser.parse_args()
 
 
 def main():
     args = get_args()
+    # 日志和保存目录（强制使用平台环境变量）
+    log_dir = Path(args.log_dir)
     save_dir = Path(args.save_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
     save_dir.mkdir(parents=True, exist_ok=True)
     
-    # 日志配置
-    writer = SummaryWriter(save_dir / 'tb_logs')
-    log_file = open(save_dir / 'train.log', 'w')
+    # 日志文件（参考main.py的命名方式）
+    log_file_path = log_dir / 'rqvae_pretrain.log'
+    log_file = open(log_file_path, 'w', buffering=1)  # 行缓冲，实时写入
+    print(f"RQVAE日志路径: {log_file_path}", flush=True)
     
-    # 1. 加载多模态数据集
-    dataset = MmEmbDataset(
-        data_dir=args.data_dir,
-        feature_id=args.feature_id
-    )
-    dataloader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        collate_fn=dataset.collate_fn,
-        pin_memory=True
-    )
-    print(f"数据集加载完成：共{len(dataset)}个item，特征ID={args.feature_id}")
+    # 写入初始参数日志（参考main.py的json格式）
+    param_log = {'args': vars(args), 'start_time': time.time()}
+    log_file.write(json.dumps(param_log) + '\n')
+    log_file.flush()
     
-    # 2. 初始化RQVAE模型
-    model = RQVAE(
-        input_dim=args.input_dim,
-        hidden_channels=args.hidden_channels,
-        latent_dim=args.latent_dim,
-        num_codebooks=args.num_codebooks,
-        codebook_size=args.codebook_size,
-        shared_codebook=args.shared_codebook,
-        kmeans_method=args.kmeans_method,
-        kmeans_iters=args.kmeans_iters,
-        distances_method=args.distances_method,
-        loss_beta=args.loss_beta,
-        device=args.device
-    ).to(args.device)
+    # 1. 加载数据集（简化输出，无tqdm）
+    print("开始加载数据集...", flush=True)
+    try:
+        dataset = MmEmbDataset(
+            data_dir=args.data_dir,
+            feature_id=args.feature_id
+        )
+        dataloader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            collate_fn=dataset.collate_fn,
+            pin_memory=True
+        )
+        data_log = {
+            'step': 'dataset_loaded',
+            'item_count': len(dataset),
+            'batch_size': args.batch_size,
+            'total_batches': len(dataloader)
+        }
+        log_file.write(json.dumps(data_log) + '\n')
+        log_file.flush()
+        print(f"数据集加载完成：{len(dataset)}个item，{len(dataloader)}个batch", flush=True)
+    except Exception as e:
+        error_log = {'step': 'dataset_error', 'error': str(e)}
+        log_file.write(json.dumps(error_log) + '\n')
+        log_file.flush()
+        print(f"数据集加载失败: {e}", flush=True)
+        return
+    
+    # 2. 初始化模型
+    print("初始化RQVAE模型...", flush=True)
+    try:
+        model = RQVAE(
+            input_dim=args.input_dim,
+            hidden_channels=args.hidden_channels,
+            latent_dim=args.latent_dim,
+            num_codebooks=args.num_codebooks,
+            codebook_size=args.codebook_size,
+            shared_codebook=args.shared_codebook,
+            kmeans_method=args.kmeans_method,
+            kmeans_iters=args.kmeans_iters,
+            distances_method=args.distances_method,
+            loss_beta=args.loss_beta,
+            device=args.device
+        ).to(args.device)
+        model_log = {'step': 'model_initialized', 'model': str(model.__class__.__name__)}
+        log_file.write(json.dumps(model_log) + '\n')
+        log_file.flush()
+        print("模型初始化成功", flush=True)
+    except Exception as e:
+        error_log = {'step': 'model_error', 'error': str(e)}
+        log_file.write(json.dumps(error_log) + '\n')
+        log_file.flush()
+        print(f"模型初始化失败: {e}", flush=True)
+        return
     
     # 3. 优化器
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     
-    # 4. 预训练RQVAE
+    # 4. 训练过程（无tqdm，用固定间隔打印）
+    global_step = 0
     best_total_loss = float('inf')
-    for epoch in range(args.num_epochs):
+    print(f"开始训练（共{args.num_epochs}轮）...", flush=True)
+    
+    for epoch in range(1, args.num_epochs + 1):
         model.train()
         epoch_start = time.time()
         total_losses = 0.0
         recon_losses = 0.0
         rq_losses = 0.0
         
-        for batch in tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.num_epochs}"):
-            tid_batch, emb_batch = batch  # emb_batch: [B, input_dim]
+        # 遍历batch（无tqdm，手动计数）
+        for batch_idx, batch in enumerate(dataloader):
+            tid_batch, emb_batch = batch
             emb_batch = emb_batch.to(args.device)
             
             # 前向传播
@@ -108,71 +129,113 @@ def main():
             total_losses += total_loss.item()
             recon_losses += recon_loss.item()
             rq_losses += rqvae_loss.item()
+            
+            # 每log_interval步打印一次（参考main.py的步频）
+            if (batch_idx + 1) % args.log_interval == 0:
+                step_log = {
+                    'step': 'train_step',
+                    'epoch': epoch,
+                    'batch': batch_idx + 1,
+                    'total_loss': total_loss.item(),
+                    'recon_loss': recon_loss.item(),
+                    'rq_loss': rqvae_loss.item(),
+                    'global_step': global_step
+                }
+                log_file.write(json.dumps(step_log) + '\n')
+                log_file.flush()
+                # 控制台打印简化信息
+                print(f"Epoch {epoch}, Batch {batch_idx+1}/{len(dataloader)}, Loss: {total_loss.item():.4f}", flush=True)
+            
+            global_step += 1
         
-        # 计算平均损失
+        # Epoch结束日志（参考main.py的epoch汇总）
+        epoch_time = time.time() - epoch_start
         avg_total = total_losses / len(dataloader)
         avg_recon = recon_losses / len(dataloader)
         avg_rq = rq_losses / len(dataloader)
-        epoch_time = time.time() - epoch_start
         
-        # 日志记录
-        log_msg = {
-            'epoch': epoch+1,
-            'total_loss': avg_total,
-            'recon_loss': avg_recon,
-            'rq_loss': avg_rq,
-            'time': epoch_time
+        epoch_log = {
+            'step': 'train_epoch',
+            'epoch': epoch,
+            'avg_total_loss': avg_total,
+            'avg_recon_loss': avg_recon,
+            'avg_rq_loss': avg_rq,
+            'time': epoch_time,
+            'global_step': global_step
         }
-        print(log_msg)
-        log_file.write(f"{log_msg}\n")
+        log_file.write(json.dumps(epoch_log) + '\n')
         log_file.flush()
         
-        # TensorBoard
-        writer.add_scalar('Loss/total', avg_total, epoch)
-        writer.add_scalar('Loss/recon', avg_recon, epoch)
-        writer.add_scalar('Loss/rq', avg_rq, epoch)
+        # 控制台打印epoch汇总
+        print(f"\n===== Epoch {epoch} 完成 =====", flush=True)
+        print(f"平均总损失: {avg_total:.4f}", flush=True)
+        print(f"平均重构损失: {avg_recon:.4f}", flush=True)
+        print(f"平均RQ损失: {avg_rq:.4f}", flush=True)
+        print(f"耗时: {epoch_time:.2f}秒\n", flush=True)
         
         # 保存最佳模型
         if avg_total < best_total_loss:
             best_total_loss = avg_total
-            torch.save(model.state_dict(), save_dir / 'best_rqvae.pt')
-            print(f"保存最佳模型至 {save_dir / 'best_rqvae.pt'}")
+            model_path = save_dir / f"best_rqvae_epoch{epoch}.pt"
+            torch.save(model.state_dict(), model_path)
+            save_log = {
+                'step': 'model_saved',
+                'epoch': epoch,
+                'best_loss': best_total_loss,
+                'path': str(model_path)
+            }
+            log_file.write(json.dumps(save_log) + '\n')
+            log_file.flush()
+            print(f"保存最佳模型至: {model_path}", flush=True)
     
-    # 5. 生成并保存全量item的语义ID
-    print("开始生成语义ID...")
-    model.load_state_dict(torch.load(save_dir / 'best_rqvae.pt'))
-    model.eval()
-    semantic_id_dict = {}  # {原始item ID: [c1, c2, ..., cN]}
-    
-    with torch.no_grad():
-        full_dataloader = DataLoader(
-            dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-            collate_fn=dataset.collate_fn,
-            pin_memory=True
-        )
+    # 5. 生成语义ID（同样无tqdm）
+    print("开始生成语义ID...", flush=True)
+    try:
+        model.load_state_dict(torch.load(save_dir / f"best_rqvae_epoch{epoch}.pt", map_location=args.device))
+        model.eval()
+        semantic_id_dict = {}
         
-        for batch in tqdm(full_dataloader, desc="生成语义ID"):
-            tid_batch, emb_batch = batch
-            emb_batch = emb_batch.to(args.device)
-            
-            # 生成语义ID
-            semantic_ids = model.get_codebook(emb_batch)  # [B, num_codebooks]
-            
-            # 保存到字典（tid为原始item ID）
-            for tid, sid in zip(tid_batch.numpy(), semantic_ids.cpu().numpy()):
-                semantic_id_dict[str(tid)] = sid.tolist()  # 与Dataset中的indexer_i_rev对应
+        with torch.no_grad():
+            # 遍历所有数据生成语义ID
+            for batch_idx, batch in enumerate(dataloader):
+                tid_batch, emb_batch = batch
+                emb_batch = emb_batch.to(args.device)
+                semantic_ids = model.get_codebook(emb_batch)  # 获取语义ID
+                
+                # 保存到字典
+                for tid, sid in zip(tid_batch.numpy(), semantic_ids.cpu().numpy()):
+                    semantic_id_dict[str(tid)] = sid.tolist()
+                
+                # 打印进度
+                if (batch_idx + 1) % args.log_interval == 0:
+                    print(f"生成语义ID: 已处理 {batch_idx+1}/{len(dataloader)} 个batch", flush=True)
+        
+        # 保存语义ID文件
+        semantic_id_path = save_dir / f"semantic_ids_{args.feature_id}.pkl"
+        with open(semantic_id_path, 'wb') as f:
+            pickle.dump(semantic_id_dict, f)
+        
+        # 记录完成日志
+        final_log = {
+            'step': 'semantic_id_generated',
+            'count': len(semantic_id_dict),
+            'path': str(semantic_id_path),
+            'end_time': time.time()
+        }
+        log_file.write(json.dumps(final_log) + '\n')
+        log_file.flush()
+        print(f"\n语义ID生成完成，共{len(semantic_id_dict)}个item，路径: {semantic_id_path}", flush=True)
     
-    # 保存语义ID
-    semantic_id_path = save_dir / f'semantic_ids_{args.feature_id}.pkl'
-    with open(semantic_id_path, 'wb') as f:
-        pickle.dump(semantic_id_dict, f)
-    print(f"语义ID保存完成：{semantic_id_path}，共{len(semantic_id_dict)}个item")
+    except Exception as e:
+        error_log = {'step': 'semantic_id_error', 'error': str(e)}
+        log_file.write(json.dumps(error_log) + '\n')
+        log_file.flush()
+        print(f"生成语义ID失败: {e}", flush=True)
+        return
     
-    writer.close()
+    # 结束
     log_file.close()
+    print("===== RQVAE预训练全部完成 =====", flush=True)
 
 
 if __name__ == '__main__':
